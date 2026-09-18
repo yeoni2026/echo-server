@@ -9,9 +9,11 @@
 #include <signal.h>
 #include <assert.h>
 #include <sys/wait.h>
+#include <pthread.h>
+#include "start_routine.h"
 
 #define PORT 8080
-
+#define MAX_NTHREAD 50
 
 volatile sig_atomic_t keep_running = 1;
 
@@ -57,12 +59,6 @@ int main(){
         exit(EXIT_FAILURE);
     }
 
-    int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
-        perror("setsockopt 실패");
-        exit(EXIT_FAILURE);
-    }
-
     // 주소 구조체 초기화 및 설정
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -92,51 +88,31 @@ int main(){
     pid_t worker_pid;
     size_t pid_size = 0;
 
+    pthread_t *watcher_id = malloc(sizeof(pthread_t));
+    pthread_t *worker_id = malloc(sizeof(pthread_t) * MAX_NTHREAD);
+    size_t nthread = 0;
+
+    // watcher 구조체 설정.
+    watcher_arg *wc_arg = malloc(sizeof(watch_arg));
+    wc_arg->worker_id = worker_id;
+    wc_arg->nthread = &nthread;
+    
+    pthread_create(watcher_id, NULL, watcher, wc_arg);
+
     // 새 통신용 소켓(client_fd) 발급 (연결될 때까지 프로세스는 Blocked)
     while(keep_running){
-        while((worker_pid = waitpid(-1, NULL, WNOHANG)) > 0){
-            assert(pid_size >= 1);
-            deletePid(pid_array, pid_size, worker_pid);
-            --pid_size;
-        }
-
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         
         if (client_fd == -1){
-            if (errno == EINTR) {
-                continue;
-            }
             perror("접속 수락 실패");
             continue;
         }
         
         printf("클라이언트 연결 성공!\n");
 
-        pid_array[pid_size] = fork();
-        if (pid_array[pid_size] == -1){
-            perror("Fork 실패!");
-            close(client_fd);
-            continue;
-        } 
-        else if (pid_array[pid_size] == 0){
-            close(server_fd);
-
-            char str_fd[8];
-            char str_idx[8];
-            snprintf(str_fd, sizeof(str_fd), "%d", client_fd);
-            snprintf(str_idx, sizeof(str_idx), "%ld", pid_size);
-            
-            char *argv[4] = {"./worker", str_fd, str_idx, NULL};
-            execvp(argv[0], argv);
-
-            perror("execvp 실패!");
-            close(client_fd);
-            exit(EXIT_FAILURE);
-        } else {
-            ++pid_size;
-            close(client_fd);
-        }
-        
+        ++nthread;
+        pthread_create(&thread_array[nthread], NULL, worker, (void *)&client_fd);
+        // arg에 담을것 : client_fd, 하나? 
     }
 
     for (size_t i = 0; i < pid_size; ++i){
