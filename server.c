@@ -84,42 +84,65 @@ int main(){
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
-    pid_t pid_array[64];
-    pid_t worker_pid;
-    size_t pid_size = 0;
-
-    pthread_t *watcher_id = malloc(sizeof(pthread_t));
+    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_t *worker_id = malloc(sizeof(pthread_t) * MAX_NTHREAD);
     size_t nthread = 0;
+    int client_fd[MAX_NTHREAD];
 
-    // watcher 구조체 설정.
-    watcher_arg *wc_arg = malloc(sizeof(watch_arg));
-    wc_arg->worker_id = worker_id;
-    wc_arg->nthread = &nthread;
-    
-    pthread_create(watcher_id, NULL, watcher, wc_arg);
+    // worker 구조체 설정.
+    worker_arg *wk_arg = malloc(sizeof(worker_arg));
+    wk_arg->cond = &cond;
+    wk_arg->mutex = &mutex;
+    wk_arg->client_fd = client_fd;
+    wk_arg->worker_id = worker_id;
+    wk_arg->nthread = &nthread;
 
     // 새 통신용 소켓(client_fd) 발급 (연결될 때까지 프로세스는 Blocked)
     while(keep_running){
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-        
-        if (client_fd == -1){
+        if (nthread == MAX_NTHREAD){
+            pthread_mutex_lock(&mutex);
+            pthread_cond_wait(&cond, &mutex);
+            pthread_mutex_unlock(&mutex);
+            continue;
+        }
+        /* 왜 바로 worker_id[nthread]로 담지 않았나: nthread값에 대한 race condition이 안 터지려면 mutex 안에 넣어야 하는데, 
+        accept함수로 blocked되면 다른 스레드들이 mutex를 못쓰게되므로 임시 변수 my_client_fd에 담는다!*/
+        int my_client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (my_client_fd == -1){
+            if (errno == EINTR) {
+                continue;
+            }
             perror("접속 수락 실패");
             continue;
         }
-        
         printf("클라이언트 연결 성공!\n");
 
+        pthread_mutex_lock(&mutex);
+        client_fd[nthread] = my_client_fd;
+        pthread_create(&worker_id[nthread], NULL, worker, wk_arg);
         ++nthread;
-        pthread_create(&thread_array[nthread], NULL, worker, (void *)&client_fd);
-        // arg에 담을것 : client_fd, 하나? 
+        pthread_mutex_unlock(&mutex);
     }
 
-    for (size_t i = 0; i < pid_size; ++i){
-        kill(pid_array[i], SIGTERM);
+    // 스레드 종료
+    pthread_mutex_lock(&mutex);
+    for (size_t i = 0; i < nthread; ++i){
+        pthread_cancel(worker_id[i]);
     }
-    while(wait(NULL) > 0);
-
+    while (nthread > 0){
+        pthread_cond_wait(&cond, &mutex);
+    }
+    pthread_mutex_unlock(&mutex);
+    
+    // pthread destroy
+    pthread_cond_destroy(&cond);
+    pthread_mutex_destroy(&mutex);
+    
+    // free 하기
+    free(worker_id);
+    free(wk_arg);
+    
     close(server_fd);
     return 0;
 }
